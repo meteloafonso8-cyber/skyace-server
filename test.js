@@ -43,6 +43,36 @@ function client(name) {
   const del2 = await post('/api/admin/delete', { name: 'Ana' }, {});
   ok(del2.s === 403, 'moderação sem chave é recusada');
 
+  console.log('Nomes únicos, filtro e abates');
+  const p4 = 'e'.repeat(32), p5 = 'f'.repeat(32);
+  let n = await post('/api/name', { pid: p4, name: 'Ana' });
+  ok(n.s === 409 && n.j.err === 'taken', 'nome já usado por outro jogador → 409 taken');
+  n = await post('/api/name', { pid: p4, name: 'ANA' });
+  ok(n.s === 409, 'comparação ignora maiúsculas/minúsculas');
+  n = await post('/api/name', { pid: p4, name: 'A.n_a' });
+  ok(n.s === 409, 'comparação ignora pontos, espaços e _ (anti-imitação)');
+  n = await post('/api/name', { pid: p4, name: 'f u c k' });
+  ok(n.s === 422 && n.j.err === 'bad_name', 'nome impróprio é recusado');
+  n = await post('/api/name', { pid: p4, name: 'Marco' });
+  ok(n.s === 200 && n.j.name === 'Marco', 'nome livre é reservado');
+  n = await post('/api/name', { pid: p4, name: 'Marco' });
+  ok(n.s === 200, 'o dono pode voltar a reservar o seu nome');
+  n = await post('/api/name', { pid: p4, name: 'Marco2' });
+  n = await post('/api/name', { pid: p5, name: 'Marco' });
+  ok(n.s === 200, 'ao mudar de nome, o antigo fica livre');
+  r = await post('/api/score', { pid: p4, name: 'Marco2', score: 800, time: 20, kills: 7, level: 1 });
+  ok(r.s === 200 && r.j.k === 7, 'abates da partida contam (k=7)');
+  r = await post('/api/score', { pid: p4, name: 'Marco2', score: 300, time: 20, kills: 5, level: 1 });
+  ok(r.j.k === 12 && r.j.best === 800, 'abates acumulam (k=12) e a melhor pontuação mantém-se');
+  r = await post('/api/score', { pid: p4, name: 'Marco2', score: 10, time: 10, kills: 500, level: 1 });
+  ok(r.j.k <= 12 + 35, 'abates por partida têm limite plausível (k=' + r.j.k + ')');
+  r = await post('/api/score', { pid: p5, name: 'Ana', score: 100, time: 20, kills: 1, level: 1 });
+  ok(r.j.name === 'Marco', 'enviar pontuação com nome roubado mantém o nome registado');
+  const tk = await fetch(BASE + '/api/top?board=kills&limit=5').then(x => x.json());
+  ok(tk.board === 'kills' && tk.top[0].n === 'Marco2' && tk.top[0].k > 12, 'ranking de abates ordenado');
+  const ts = await fetch(BASE + '/api/top?board=score&limit=5').then(x => x.json());
+  ok(ts.board === 'score' && ts.top[0].n === 'Ana' && ts.top[0].s === 5000, 'ranking de pontos continua a funcionar');
+
   console.log('WebSocket / salas');
   const A = client('Ana'), B = client('Rui');
   await Promise.all([A.open, B.open]);
@@ -81,6 +111,16 @@ function client(name) {
   const h2 = await fetch(BASE + '/health').then(x => x.json());
   ok(h2.rooms === 0, 'sala vazia é apagada');
 
+  const C = client('x'); await C.open;
+  C.send({ t: 'create', name: 'Hacker', pid: p4 });
+  const rc = await C.wait('room');
+  ok(rc && rc.players[0].name === 'Marco2', 'na sala usa o nome registado (não o enviado)');
+  const D = client('y'); await D.open;
+  D.send({ t: 'join', code: rc.code, name: 'f.u.c.k' });
+  const rd = await D.wait('room');
+  ok(rd && rd.players[1].name !== 'f.u.c.k' && /^Piloto\d+$/.test(rd.players[1].name), 'nome impróprio numa sala é substituído por Piloto###');
+  C.send({ t: 'start' }); const sk = client('z'); 
+  C.ws.close(); D.ws.close(); sk.ws.close();
   srv.kill();
   console.log(fails ? `\n${fails} FALHAS` : '\nTODOS OS TESTES PASSARAM');
   process.exit(fails ? 1 : 0);

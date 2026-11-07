@@ -1,6 +1,6 @@
 # Sky Ace – servidor (ranking global + multijogador)
 
-Um único ficheiro (`server.js`), **sem dependências**. Só precisa de Node.js 18+.
+Dois ficheiros (`server.js` + `filter.js`, o filtro de nomes), **sem dependências**. Só precisa de Node.js 18+.
 
 ## Testar no teu PC
 ```bash
@@ -51,6 +51,12 @@ curl -X POST https://O-TEU-SERVIDOR/api/admin/delete \
   -H "X-Admin-Key: A_TUA_CHAVE" -H "Content-Type: application/json" \
   -d '{"name":"NomeImproprio"}'
 ```
+
+## Nomes e abates (v2.1)
+- Cada jogador reserva um nome **único** (ignora maiúsculas, espaços, `.`, `_` e `-`, para ninguém se fazer passar por outro). Nomes impróprios (PT/EN/ES/FR/DE, com truques como `f.u.c.k` ou `sh1t`) são recusados; se algum já estiver guardado, é **apagado automaticamente** (passa a `Anon####`) quando o servidor arranca.
+- O servidor soma os **abates totais** de cada jogador e tem um ranking próprio (`/api/top?board=kills`).
+- O filtro é básico: não apanha tudo. Para casos que passem, usa a moderação abaixo (apaga também a reserva do nome).
+- Importante: quando atualizas o servidor, mete **também o `filter.js`** no GitHub.
 
 ## O que o servidor faz e não faz
 - Ranking: guarda por jogador (ID aleatório) a melhor pontuação, com nome limpo (2–12 caracteres). Rejeita pontuações impossíveis (limite por segundo jogado) e limita pedidos por IP.

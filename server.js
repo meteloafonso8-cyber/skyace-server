@@ -13,6 +13,7 @@
 const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
+const { isBad } = require('./filter.js');
 const path = require('path');
 
 const PORT = +process.env.PORT || 8080;
@@ -98,25 +99,35 @@ async function redisRetry(cmd, tries = 3) {
     }
   }
 }
+const names = new Map();     // chave (nome minúsculo sem separadores) → { p: pid, n: nome, t }
+const pidName = new Map();   // pid → chave
+const NKEY = 'skyace:names';
+const nameKey = n => String(n).toLowerCase().replace(/[\s_.\-]/g, '');
+function saveName(key) { if (REMOTE) { if (names.has(key)) redisRetry(['HSET', NKEY, key, JSON.stringify(names.get(key))]); } else touch(); }
+function dropName(key) { if (REMOTE) redisRetry(['HDEL', NKEY, key]); else touch(); }
 function save(pid) { if (REMOTE && scores.has(pid)) redisRetry(['HSET', HKEY, pid, JSON.stringify(scores.get(pid))]); }
 function drop(pid) { if (REMOTE) redisRetry(['HDEL', HKEY, pid]); }
 
-let dirty = false, sortedCache = null;
-const touch = () => { dirty = true; sortedCache = null; };
-const sorted = () => sortedCache || (sortedCache = [...scores.entries()].sort((a, b) => b[1].s - a[1].s || a[1].t - b[1].t));
+let dirty = false, cacheS = null, cacheK = null;
+const touch = () => { dirty = true; cacheS = cacheK = null; };
+const sortedScore = () => cacheS || (cacheS = [...scores.entries()].filter(e => e[1].s > 0).sort((a, b) => b[1].s - a[1].s || a[1].t - b[1].t));
+const sortedKills = () => cacheK || (cacheK = [...scores.entries()].filter(e => (e[1].k || 0) > 0).sort((a, b) => (b[1].k || 0) - (a[1].k || 0) || a[1].t - b[1].t));
 
 async function loadScores() {
   if (!REMOTE) {
     try {
       fs.mkdirSync(DATA_DIR, { recursive: true });
       const j = JSON.parse(fs.readFileSync(SCORES_FILE, 'utf8'));
-      for (const [k, v] of Object.entries(j)) scores.set(k, v);
+      const sc = j.v === 2 ? j.scores : j, nm = j.v === 2 ? j.names : {};
+      for (const [k, v] of Object.entries(sc || {})) scores.set(k, v);
+      for (const [k, v] of Object.entries(nm || {})) { names.set(k, v); pidName.set(v.p, k); }
     } catch (e) { /* primeira execução */ }
+    afterLoad();
     console.log(`Ranking em ficheiro (${SCORES_FILE}): ${scores.size} entradas`);
     setInterval(() => {
       if (!dirty) return;
       dirty = false;
-      fs.writeFile(SCORES_FILE + '.tmp', JSON.stringify(Object.fromEntries(scores)), err => {
+      fs.writeFile(SCORES_FILE + '.tmp', JSON.stringify({ v: 2, scores: Object.fromEntries(scores), names: Object.fromEntries(names) }), err => {
         if (!err) fs.rename(SCORES_FILE + '.tmp', SCORES_FILE, () => {});
       });
     }, 8000).unref();
@@ -132,8 +143,14 @@ async function loadScores() {
           if (!cur || v.s > cur.s) scores.set(arr[i], v);
         } catch (e) { /* entrada inválida */ }
       }
-      sortedCache = null;
-      console.log(`Ranking carregado do Upstash: ${scores.size} entradas`);
+      const nres = await redis(['HGETALL', NKEY]);
+      const narr = Array.isArray(nres) ? nres : Object.entries(nres || {}).flat();
+      for (let i = 0; i + 1 < narr.length; i += 2) {
+        try { const v = JSON.parse(narr[i + 1]); names.set(narr[i], v); pidName.set(v.p, narr[i]); } catch (e) { /* inválido */ }
+      }
+      cacheS = cacheK = null;
+      console.log(`Ranking carregado do Upstash: ${scores.size} entradas, ${names.size} nomes`);
+      afterLoad();
       return;
     } catch (e) {
       console.error('Upstash indisponível, a tentar de novo:', e.message);
@@ -142,38 +159,76 @@ async function loadScores() {
   }
 }
 
+function claimName(pid, raw) {
+  if (!PID_RE.test(pid)) return { err: 'pid' };
+  const n = clean(raw, '');
+  if (n.length < 2) return { err: 'short' };
+  if (isBad(n)) return { err: 'bad_name' };
+  const key = nameKey(n), owner = names.get(key);
+  if (owner && owner.p !== pid) return { err: 'taken' };
+  const sc = scores.get(pid);
+  if (owner && owner.n === n) return { ok: true, name: n, k: sc ? sc.k || 0 : 0 };   // já reservado: nada a gravar
+  const old = pidName.get(pid);
+  if (old && old !== key) { names.delete(old); dropName(old); }
+  names.set(key, { p: pid, n, t: Date.now() }); pidName.set(pid, key); saveName(key);
+  if (sc && sc.n !== n) { sc.n = n; touch(); save(pid); }
+  return { ok: true, name: n, k: sc ? sc.k || 0 : 0 };
+}
+
+// corre depois de carregar os dados: regista nomes antigos, apaga nomes impróprios e reservas esquecidas
+function afterLoad() {
+  const rand = () => 'Anon' + (1000 + crypto.randomInt(9000));
+  for (const [pid, e] of scores) {
+    const bad = isBad(e.n);
+    let key = pidName.get(pid);
+    if (!bad && key) continue;
+    if (key) { names.delete(key); dropName(key); pidName.delete(pid); }
+    let n = bad ? rand() : e.n;
+    for (let i = 0; i < 20; i++) { const o = names.get(nameKey(n)); if (!o || o.p === pid) break; n = rand(); }
+    e.n = n; key = nameKey(n);
+    names.set(key, { p: pid, n, t: Date.now() }); pidName.set(pid, key); saveName(key); save(pid);
+  }
+  for (const [k, v] of [...names]) {
+    if (isBad(v.n) || (!scores.has(v.p) && Date.now() - v.t > 30 * 86400000)) { names.delete(k); pidName.delete(v.p); dropName(k); }
+  }
+  touch();
+}
+
 function submitScore(b) {
   const pid = String(b.pid || '');
   if (!PID_RE.test(pid)) return { err: 'pid' };
   const score = int(b.score, 0, 5000000);
   const time = num(b.time, 0, 7200);
-  const level = int(b.level, 1, 99);
+  const level = int(b.level, 1, 999);
   if (time < 3) return { err: 'time' };
-  if (score > time * 2500 + 500) return { err: 'implausible' };  // filtro anti-batota básico
-  const name = clean(b.name);
-  const prev = scores.get(pid);
-  if (!prev || score > prev.s) {
-    scores.set(pid, { n: name, s: score, l: level, t: Date.now() });
-    touch(); save(pid);
-    if (scores.size > MAX_STORED_SCORES) {
-      const worst = sorted()[sorted().length - 1];
-      if (worst) { scores.delete(worst[0]); drop(worst[0]); touch(); }
-    }
-  } else if (prev.n !== name) { prev.n = name; touch(); save(pid); }
-  const list = sorted();
-  const rank = list.findIndex(e => e[0] === pid) + 1;
-  return { ok: true, rank, total: list.length, best: scores.get(pid).s };
+  if (score > time * 2500 + 500) return { err: 'implausible' };           // filtro anti-batota básico
+  let nm = pidName.has(pid) && names.has(pidName.get(pid)) ? names.get(pidName.get(pid)).n : null;
+  const wanted = clean(b.name, '');
+  if (!nm) { const r = claimName(pid, b.name); if (r.err) return { err: r.err }; nm = r.name; }
+  else if (wanted && wanted !== nm) { const r = claimName(pid, wanted); if (r.ok) nm = r.name; }
+  const kadd = Math.min(int(b.kills, 0, 2000), Math.floor(time * 3) + 5);
+  let e = scores.get(pid);
+  if (!e) { e = { n: nm, s: 0, l: 1, t: Date.now(), k: 0 }; scores.set(pid, e); }
+  e.n = nm; e.k = (e.k || 0) + kadd;
+  if (score > e.s) { e.s = score; e.l = level; e.t = Date.now(); }
+  touch(); save(pid);
+  if (scores.size > MAX_STORED_SCORES) {
+    const worst = [...scores.entries()].sort((a, b) => a[1].s - b[1].s)[0];
+    if (worst) { scores.delete(worst[0]); drop(worst[0]); touch(); }
+  }
+  const list = sortedScore();
+  return { ok: true, rank: e.s > 0 ? list.findIndex(x => x[0] === pid) + 1 : 0, total: list.length, best: e.s, k: e.k, name: nm };
 }
 
-function topView(limit, pid) {
-  const list = sorted();
-  const top = list.slice(0, limit).map((e, i) => ({ r: i + 1, n: e[1].n, s: e[1].s, l: e[1].l, you: e[0] === pid }));
+function topView(limit, pid, board) {
+  const list = board === 'kills' ? sortedKills() : sortedScore();
+  const top = list.slice(0, limit).map((x, i) => ({ r: i + 1, n: x[1].n, s: x[1].s, k: x[1].k || 0, l: x[1].l, you: x[0] === pid }));
   let me = null;
   if (pid && PID_RE.test(pid)) {
-    const i = list.findIndex(e => e[0] === pid);
-    if (i >= 0) me = { r: i + 1, n: list[i][1].n, s: list[i][1].s };
+    const i = list.findIndex(x => x[0] === pid);
+    if (i >= 0) me = { r: i + 1, n: list[i][1].n, s: list[i][1].s, k: list[i][1].k || 0 };
   }
-  return { top, me, total: list.length };
+  return { top, me, total: list.length, board: board === 'kills' ? 'kills' : 'score' };
 }
 
 /* ------------------------------------------------------------------ */
@@ -211,7 +266,7 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET' && url.pathname === '/api/top') {
     if (limited('g:' + ip, 120, 60000)) return send(res, 429, { err: 'rate' });
     const limit = int(url.searchParams.get('limit') || 15, 1, 50);
-    return send(res, 200, topView(limit, url.searchParams.get('pid') || ''));
+    return send(res, 200, topView(limit, url.searchParams.get('pid') || '', url.searchParams.get('board') === 'kills' ? 'kills' : 'score'));
   }
 
   if (req.method === 'POST' && url.pathname === '/api/score') {
@@ -219,7 +274,16 @@ const server = http.createServer((req, res) => {
     return readBody(req, (err, body) => {
       if (err) return send(res, 400, { err: 'json' });
       const r = submitScore(body);
-      send(res, r.err ? 422 : 200, r);
+      send(res, r.err ? (r.err === 'taken' ? 409 : 422) : 200, r);
+    });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/name') {
+    if (limited('n:' + ip, 30, 60000)) return send(res, 429, { err: 'rate' });
+    return readBody(req, (err, body) => {
+      if (err) return send(res, 400, { err: 'json' });
+      const r = claimName(String(body.pid || ''), body.name);
+      send(res, r.err ? (r.err === 'taken' ? 409 : 422) : 200, r);
     });
   }
 
@@ -229,8 +293,20 @@ const server = http.createServer((req, res) => {
       if (err) return send(res, 400, { err: 'json' });
       // apagar por pid, ou por nome (apaga todas as entradas com esse nome)
       let n = 0;
-      if (body.pid && scores.delete(String(body.pid))) { drop(String(body.pid)); n++; }
-      if (body.name) for (const [k, v] of scores) if (v.n === String(body.name)) { scores.delete(k); drop(k); n++; }
+      const delPid = pid => {
+        let hit = false;
+        if (scores.delete(pid)) { drop(pid); hit = true; }
+        const k = pidName.get(pid);
+        if (k) { names.delete(k); dropName(k); pidName.delete(pid); hit = true; }
+        return hit;
+      };
+      if (body.pid && delPid(String(body.pid))) n++;
+      if (body.name) {
+        const want = nameKey(String(body.name));
+        const o = names.get(want);
+        if (o && delPid(o.p)) n++;
+        for (const [pid, e] of [...scores]) if (nameKey(e.n) === want && delPid(pid)) n++;
+      }
       if (n) touch();
       send(res, 200, { ok: true, deleted: n });
     });
@@ -344,6 +420,12 @@ function roomInfo(room) {
   for (const p of room.players)
     wsSend(p.c, { t: 'room', code: room.code, you: p.id, host: room.hostId, state: room.state, players: room.players.map(q => ({ id: q.id, name: q.name })) });
 }
+function playerName(pid, fallback) {
+  const k = PID_RE.test(String(pid || '')) ? pidName.get(String(pid)) : null;
+  if (k && names.has(k)) return names.get(k).n;
+  const n = clean(fallback, '');
+  return n.length >= 2 && !isBad(n) ? n : 'Piloto' + (100 + crypto.randomInt(900));
+}
 function addPlayer(room, c, name) {
   const p = { id: room.nextId++, name, c, score: 0, done: false };
   room.players.push(p); c.room = room; c.p = p;
@@ -382,36 +464,36 @@ function onMessage(c, m) {
   const t = m.t;
   if (t === 'create') {
     if (c.room) return;
-    if (rooms.size >= MAX_ROOMS || limited('c:' + c.ip, 10, 60000)) return wsSend(c, { t: 'err', m: 'Servidor cheio. Tenta daqui a pouco.' });
+    if (rooms.size >= MAX_ROOMS || limited('c:' + c.ip, 10, 60000)) return wsSend(c, { t: 'err', code: 'srv_full', m: 'Servidor cheio. Tenta daqui a pouco.' });
     const code = newCode();
-    if (!code) return wsSend(c, { t: 'err', m: 'Não foi possível criar sala.' });
+    if (!code) return wsSend(c, { t: 'err', code: 'srv_full', m: 'Não foi possível criar sala.' });
     const room = { code, state: 'lobby', players: [], hostId: 0, nextId: 1, seed: 0, timer: null, left: [] };
     rooms.set(code, room);
-    const p = addPlayer(room, c, clean(m.name));
+    const p = addPlayer(room, c, playerName(m.pid, m.name));
     room.hostId = p.id;
     return roomInfo(room);
   }
   if (t === 'join') {
     if (c.room) return;
-    if (limited('j:' + c.ip, 30, 60000)) return wsSend(c, { t: 'err', m: 'Demasiadas tentativas.' });
+    if (limited('j:' + c.ip, 30, 60000)) return wsSend(c, { t: 'err', code: 'busy', m: 'Demasiadas tentativas.' });
     const room = rooms.get(String(m.code || '').toUpperCase().trim());
-    if (!room) return wsSend(c, { t: 'err', m: 'Sala não encontrada.' });
-    if (room.state !== 'lobby') return wsSend(c, { t: 'err', m: 'A partida já começou.' });
-    if (room.players.length >= ROOM_MAX_PLAYERS) return wsSend(c, { t: 'err', m: 'Sala cheia (máx. 4).' });
-    addPlayer(room, c, clean(m.name));
+    if (!room) return wsSend(c, { t: 'err', code: 'not_found', m: 'Sala não encontrada.' });
+    if (room.state !== 'lobby') return wsSend(c, { t: 'err', code: 'started', m: 'A partida já começou.' });
+    if (room.players.length >= ROOM_MAX_PLAYERS) return wsSend(c, { t: 'err', code: 'full', m: 'Sala cheia (máx. 4).' });
+    addPlayer(room, c, playerName(m.pid, m.name));
     return roomInfo(room);
   }
   const room = c.room, p = c.p;
   if (!room) return;
   if (t === 'start') {
     if (p.id !== room.hostId || room.state !== 'lobby') return;
-    if (room.players.length < 2) return wsSend(c, { t: 'err', m: 'São precisos pelo menos 2 jogadores.' });
+    if (room.players.length < 2) return wsSend(c, { t: 'err', code: 'need2', m: 'São precisos pelo menos 2 jogadores.' });
     return startMatch(room);
   }
   if (t === 'pos') {
     if (room.state !== 'running') return;
     p.score = int(m.s, 0, 1000000);
-    return toAll(room, { t: 'pos', id: p.id, x: num(m.x, 0, 360), y: num(m.y, 0, 520), b: num(m.b, -3.5, 3.5), s: p.score, h: int(m.h, 0, 100), a: m.a ? 1 : 0 }, p);
+    return toAll(room, { t: 'pos', id: p.id, x: num(m.x, 0, 360), y: num(m.y, 0, 520), b: num(m.b, -3.5, 3.5), s: p.score, h: int(m.h, 0, 100), a: m.a ? 1 : 0, k: int(m.k, 0, 15) }, p);
   }
   if (t === 'atk') {
     if (room.state !== 'running') return;
@@ -432,4 +514,4 @@ function onMessage(c, m) {
 
 server.listen(PORT, () => console.log(`Sky Ace server a ouvir na porta ${PORT}`));
 loadScores();
-process.on('SIGTERM', () => { try { if (REMOTE) process.exit(0); fs.writeFileSync(SCORES_FILE, JSON.stringify(Object.fromEntries(scores))); } catch (e) { /* ignorar */ } process.exit(0); });
+process.on('SIGTERM', () => { try { if (REMOTE) process.exit(0); fs.writeFileSync(SCORES_FILE, JSON.stringify({ v: 2, scores: Object.fromEntries(scores), names: Object.fromEntries(names) })); } catch (e) { /* ignorar */ } process.exit(0); });
