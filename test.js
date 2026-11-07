@@ -1,0 +1,87 @@
+'use strict';
+// Teste automático: node test.js   (precisa de Node 22+ por causa do WebSocket global)
+const { spawn } = require('child_process');
+const os = require('os'), fs = require('fs'), path = require('path');
+
+const PORT = 18099, BASE = 'http://127.0.0.1:' + PORT;
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'skyace-'));
+const srv = spawn('node', [path.join(__dirname, 'server.js')], { env: { ...process.env, PORT, DATA_DIR: dir, ADMIN_KEY: 'k' }, stdio: 'inherit' });
+
+let fails = 0;
+const ok = (c, msg) => { console.log((c ? '  ok  ' : ' FAIL ') + msg); if (!c) fails++; };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const post = (p, b, h = {}) => fetch(BASE + p, { method: 'POST', headers: { 'Content-Type': 'application/json', ...h }, body: JSON.stringify(b) }).then(async r => ({ s: r.status, j: await r.json() }));
+
+function client(name) {
+  const ws = new WebSocket('ws://127.0.0.1:' + PORT + '/ws');
+  const c = { ws, msgs: [], name };
+  ws.onmessage = e => c.msgs.push(JSON.parse(e.data));
+  c.open = new Promise(r => (ws.onopen = r));
+  c.send = o => ws.send(JSON.stringify(o));
+  c.wait = async (t, ms = 3000) => { const s = Date.now(); while (Date.now() - s < ms) { const i = c.msgs.findIndex(m => m.t === t); if (i >= 0) return c.msgs.splice(i, 1)[0]; await sleep(20); } return null; };
+  return c;
+}
+
+(async () => {
+  await sleep(500);
+  console.log('REST / ranking');
+  const pid1 = 'a'.repeat(32), pid2 = 'b'.repeat(32);
+  let r = await post('/api/score', { pid: pid1, name: 'Ana', score: 5000, time: 60, level: 4 });
+  ok(r.s === 200 && r.j.rank === 1, 'submeter pontuação válida → rank 1');
+  r = await post('/api/score', { pid: pid2, name: 'Rui <script>', score: 9000, time: 80, level: 5 });
+  ok(r.s === 200 && r.j.rank === 1, 'pontuação maior fica em 1º');
+  r = await post('/api/score', { pid: pid1, name: 'Ana', score: 100, time: 30, level: 1 });
+  ok(r.j.best === 5000, 'pontuação pior não substitui a melhor');
+  r = await post('/api/score', { pid: 'c'.repeat(32), name: 'Batoteiro', score: 4000000, time: 10, level: 9 });
+  ok(r.s === 422, 'pontuação impossível é rejeitada');
+  r = await post('/api/score', { pid: 'xx', name: 'X', score: 10, time: 10 });
+  ok(r.s === 422, 'pid inválido é rejeitado');
+  const top = await fetch(BASE + '/api/top?limit=5&pid=' + pid1).then(x => x.json());
+  ok(top.top.length === 2 && top.top[0].n === 'Rui script' && top.top[1].you === true && top.me.r === 2, 'top devolve nomes limpos, marca "you" e "me"');
+  const del = await post('/api/admin/delete', { name: 'Rui script' }, { 'X-Admin-Key': 'k' });
+  ok(del.j.deleted === 1, 'moderação: apagar entrada por nome');
+  const del2 = await post('/api/admin/delete', { name: 'Ana' }, {});
+  ok(del2.s === 403, 'moderação sem chave é recusada');
+
+  console.log('WebSocket / salas');
+  const A = client('Ana'), B = client('Rui');
+  await Promise.all([A.open, B.open]);
+  A.send({ t: 'create', name: 'Ana' });
+  const ra = await A.wait('room');
+  ok(ra && /^[A-Z2-9]{5}$/.test(ra.code) && ra.host === ra.you, 'criar sala devolve código de 5 letras e anfitrião');
+  B.send({ t: 'join', code: 'ZZZZZ', name: 'Rui' });
+  ok((await B.wait('err')) !== null, 'código inexistente dá erro');
+  B.send({ t: 'join', code: ra.code.toLowerCase(), name: 'Rui' });
+  const rb = await B.wait('room');
+  ok(rb && rb.players.length === 2, 'entrar com o código (minúsculas) funciona');
+  B.send({ t: 'start' });
+  await sleep(150);
+  ok(!A.msgs.some(m => m.t === 'start'), 'só o anfitrião pode iniciar');
+  A.send({ t: 'start' });
+  const sa = await A.wait('start'), sb = await B.wait('start');
+  ok(sa && sb && sa.seed === sb.seed && sa.dur === 120000, 'start com a mesma seed para todos');
+  A.send({ t: 'pos', x: 100, y: 200, b: 0.5, s: 1234, h: 80, a: 1 });
+  const pa = await B.wait('pos');
+  ok(pa && pa.x === 100 && pa.s === 1234 && pa.id === ra.you, 'posições chegam ao outro jogador');
+  A.send({ t: 'atk', k: 'wave' });
+  const at = await B.wait('atk');
+  ok(at && at.k === 'wave' && at.name === 'Ana', 'ataque é reencaminhado ao rival');
+  A.send({ t: 'done', s: 1500 });
+  B.send({ t: 'done', s: 3000 });
+  const res = await A.wait('results');
+  ok(res && res.list[0].name === 'Rui' && res.list[0].score === 3000 && res.list[1].name === 'Ana', 'resultados ordenados por pontos');
+  const again = await A.wait('room');
+  ok(again && again.state === 'lobby', 'sala volta ao lobby para desforra');
+  B.send({ t: 'leave' });
+  const left = await A.wait('left');
+  ok(left && left.id === rb.you, 'saída de um jogador é notificada');
+  const h = await fetch(BASE + '/health').then(x => x.json());
+  ok(h.ok && h.rooms === 1, '/health responde');
+  A.ws.close(); await sleep(200);
+  const h2 = await fetch(BASE + '/health').then(x => x.json());
+  ok(h2.rooms === 0, 'sala vazia é apagada');
+
+  srv.kill();
+  console.log(fails ? `\n${fails} FALHAS` : '\nTODOS OS TESTES PASSARAM');
+  process.exit(fails ? 1 : 0);
+})().catch(e => { console.error(e); srv.kill(); process.exit(1); });
